@@ -539,7 +539,6 @@ def rss_entries() -> List[dict]:
     return out
 
 # ===================== Company detection =====================
-# ===================== Company detection =====================
 TICKER_RE = re.compile(r"(?<![A-Z])\$?([A-Z]{1,5})(?![A-Z])")  # fixed: use \$? (not \\$?)
 
 def pick_companies(text: str, ticker_map: Dict[str,str], name_index: Dict[str,Tuple[str,str]]) -> List[Tuple[str,str]]:
