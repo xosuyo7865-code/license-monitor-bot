@@ -461,12 +461,25 @@ def is_license_out_doc(title: str, body: str):
     return False, {"reason": "below threshold", "sim_title": sim_title, "sim_body": sim_body}
 
 # ===================== Discord + LLM =====================
-def push_discord(title: str, description: str, url: str = ""):
+def push_discord(title: str, description: str, url: str = "", published_dt_utc: datetime.datetime | None = None):
     if not DISCORD_WEBHOOK_URL:
         print("[discord] webhook not set; skipping"); return
-    payload = {"username": "News Scanner", "embeds": [{"title": title[:256], "description": description[:4000]}]}
-    if url: payload["embeds"][0]["url"] = url
-    try: requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+from zoneinfo import ZoneInfo
+payload = {"username": "News Scanner", "embeds": [{"title": title[:256], "description": description[:4000]}]}
+if url:
+    payload["embeds"][0]["url"] = url
+# Footer time (KST) if available
+if published_dt_utc is not None:
+    try:
+        kst = published_dt_utc.astimezone(ZoneInfo("Asia/Seoul"))
+        footer_text = f"Published: {kst.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+        payload["embeds"][0]["footer"] = {"text": footer_text}
+    except Exception:
+        # Fallback to UTC representation
+        footer_text = f"Published (UTC): {published_dt_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        payload["embeds"][0]["footer"] = {"text": footer_text}
+try:
+    requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
     except Exception as e: print(f"[discord] post error: {e}")
 
 def summarize_and_translate(text: str, lang: str = TARGET_LANG) -> str:
@@ -500,12 +513,28 @@ def rss_entries() -> List[dict]:
             feed = feedparser.parse(url)
             for e in feed.entries:
                 key = e.get("id") or e.get("link") or e.get("title")
-                out.append({
-                    "key": key or "",
-                    "title": e.get("title") or "",
-                    "summary": e.get("summary") or e.get("description") or "",
-                    "link": e.get("link") or "",
-                })
+                # Determine published datetime (UTC) if present
+ts = None
+try:
+    if getattr(e, "published_parsed", None):
+        import feedparser as _fp
+        ts = _fp.mktime_tz(e.published_parsed)
+    elif getattr(e, "updated_parsed", None):
+        import feedparser as _fp
+        ts = _fp.mktime_tz(e.updated_parsed)
+except Exception:
+    ts = None
+published_dt = None
+if ts:
+    published_dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+
+out.append({
+    "key": key or "",
+    "title": e.get("title") or "",
+    "summary": e.get("summary") or e.get("description") or "",
+    "link": e.get("link") or "",
+    "published_dt": published_dt.isoformat() if published_dt else "",
+})
         except Exception as ex:
             print(f"[rss] fetch error: {url} -> {ex}")
     return out
@@ -573,7 +602,10 @@ def run_cycle():
         ticker_line = ", ".join([f"{t} (CIK {c})" for t,c in companies])
         desc = summary + (f"\\n\\n{ticker_line}" if ticker_line else "")
         tag = "LICENSE" if ok else sp_dbg.get("category","").upper()
-        push_discord(f"[RSS][{tag}] {title}", desc, e.get("link",""))
+        # Convert ISO back to aware datetime
+        pub_iso = e.get("published_dt")
+        pub_dt = datetime.datetime.fromisoformat(pub_iso) if pub_iso else None
+        push_discord(f"[RSS][{tag}] {title}", desc, e.get("link",""), published_dt_utc=pub_dt)
 
     _stats.last_finished = iso_now()
     _stats.last_hits = hits
