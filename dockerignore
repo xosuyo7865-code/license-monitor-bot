@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*.dist-info/
+*.egg-info/
+
+# Venv
+venv/
+.venv/
+env/
+ENV/
+
+# OS / VCS
+.DS_Store
+.git
+.gitignore
+.gitmodules
+
+# Editor
+.vscode/
+.idea/
+
+# Data & logs (runtime-generated)
+data/
+!data/.gitkeep
+*.log
+*.out
+*.err
+
+# Cache
+.cache/
