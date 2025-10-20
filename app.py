@@ -302,7 +302,6 @@ def _max_sim(vec, qvecs):
     if not vec: return 0.0
     return max(_cos(vec, q) for q in qvecs)
 
-
 def is_supply_or_purchase_doc(title: str, body: str):
     """
     Returns (matched: bool, info: dict)
@@ -487,7 +486,6 @@ def push_discord(title: str, description: str, url: str = "", published_dt_utc: 
     except Exception as e:
         print(f"[discord] post error: {e}")
 
-def summarize_and_translate(text: str, lang: str = TARGET_LANG) -> str:
 def summarize_and_translate(text: str, lang: str = TARGET_LANG) -> str:
     if not OPENAI_API_KEY: return text[:1000]
     try:
