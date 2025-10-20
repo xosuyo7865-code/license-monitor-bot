@@ -463,25 +463,31 @@ def is_license_out_doc(title: str, body: str):
 # ===================== Discord + LLM =====================
 def push_discord(title: str, description: str, url: str = "", published_dt_utc: datetime.datetime | None = None):
     if not DISCORD_WEBHOOK_URL:
-        print("[discord] webhook not set; skipping"); return
-from zoneinfo import ZoneInfo
-payload = {"username": "News Scanner", "embeds": [{"title": title[:256], "description": description[:4000]}]}
-if url:
-    payload["embeds"][0]["url"] = url
-# Footer time (KST) if available
-if published_dt_utc is not None:
+        print("[discord] webhook not set; skipping")
+        return
+    from zoneinfo import ZoneInfo
+    payload = {"username": "News Scanner", "embeds": [{"title": title[:256], "description": description[:4000]}]}
+    if url:
+        payload["embeds"][0]["url"] = url
+    # Footer time (ET + KST) if available
+    if published_dt_utc is not None:
+        try:
+            et = published_dt_utc.astimezone(ZoneInfo("America/New_York"))
+            kst = published_dt_utc.astimezone(ZoneInfo("Asia/Seoul"))
+            footer_text = (
+                f"Published: {et.strftime('%Y-%m-%d %H:%M')} ET "
+                f"({kst.strftime('%Y-%m-%d %H:%M')} KST)"
+            )
+        except Exception:
+            # Fallback to UTC representation
+            footer_text = f"Published (UTC): {published_dt_utc.strftime('%Y-%m-%d %H:%M UTC')}"
+        payload["embeds"][0]["footer"] = {"text": footer_text}
     try:
-        kst = published_dt_utc.astimezone(ZoneInfo("Asia/Seoul"))
-        footer_text = f"Published: {kst.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-        payload["embeds"][0]["footer"] = {"text": footer_text}
-    except Exception:
-        # Fallback to UTC representation
-        footer_text = f"Published (UTC): {published_dt_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
-        payload["embeds"][0]["footer"] = {"text": footer_text}
-try:
-    requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-    except Exception as e: print(f"[discord] post error: {e}")
+        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[discord] post error: {e}")
 
+def summarize_and_translate(text: str, lang: str = TARGET_LANG) -> str:
 def summarize_and_translate(text: str, lang: str = TARGET_LANG) -> str:
     if not OPENAI_API_KEY: return text[:1000]
     try:
@@ -514,31 +520,25 @@ def rss_entries() -> List[dict]:
             for e in feed.entries:
                 key = e.get("id") or e.get("link") or e.get("title")
                 # Determine published datetime (UTC) if present
-ts = None
-try:
-    if getattr(e, "published_parsed", None):
-        import feedparser as _fp
-        ts = _fp.mktime_tz(e.published_parsed)
-    elif getattr(e, "updated_parsed", None):
-        import feedparser as _fp
-        ts = _fp.mktime_tz(e.updated_parsed)
-except Exception:
-    ts = None
-published_dt = None
-if ts:
-    published_dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-
-out.append({
-    "key": key or "",
-    "title": e.get("title") or "",
-    "summary": e.get("summary") or e.get("description") or "",
-    "link": e.get("link") or "",
-    "published_dt": published_dt.isoformat() if published_dt else "",
-})
+                published_dt = None
+                try:
+                    t = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
+                    if t:
+                        published_dt = datetime.datetime(*t[:6], tzinfo=datetime.timezone.utc)
+                except Exception:
+                    published_dt = None
+                out.append({
+                    "key": key or "",
+                    "title": e.get("title") or "",
+                    "summary": e.get("summary") or e.get("description") or "",
+                    "link": e.get("link") or "",
+                    "published_dt": published_dt.isoformat() if published_dt else "",
+                })
         except Exception as ex:
             print(f"[rss] fetch error: {url} -> {ex}")
     return out
 
+# ===================== Company detection =====================
 # ===================== Company detection =====================
 TICKER_RE = re.compile(r"(?<![A-Z])\$?([A-Z]{1,5})(?![A-Z])")  # fixed: use \$? (not \\$?)
 
