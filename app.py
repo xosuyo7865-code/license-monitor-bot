@@ -120,6 +120,35 @@ TITLE_BONUS      = float(os.getenv("TITLE_BONUS", "0.03"))
 MAX_ARTICLE_LEN  = int(os.getenv("MAX_ARTICLE_LEN", "6000"))
 
 _SENT_SPLIT = re.compile(r'(?<=[\.!?])\s+')
+
+# ---------- False-positive guardrails (supply/purchase/gov only) ----------
+
+# ---------- Intent/Rumor markers (for *_INTENT tagging) ----------
+INTENT_TAG_MARKERS = re.compile(
+    r"\b(plans?\s+to|intends?\s+to|aims?\s+to|seeks?\s+to|in\s+talks\s+to|negotiat(?:e|ing)\s+to|under\s+discussion|reportedly|rumored|according\s+to\s+sources)\b",
+    re.I
+)
+
+def _has_intent_marker(s: str) -> bool:
+    return bool(INTENT_TAG_MARKERS.search(s or ""))
+YEAR_OLD = re.compile(r"\b(20\d{2}|19\d{2})\b")
+BACKGROUND_MARKERS = re.compile(r"\b(previously|back\s+in|in\s+\d{4}|as\s+of\s+\d{4}|historically|earlier|formerly|prior\s+to)\b", re.I)
+INTENT_MARKERS = re.compile(r"\b(intends?\s+to|plans?\s+to|aims?\s+to|seeks?\s+to|in\s+talks\s+to|negotiat(?:e|ing)\s+to|explor(?:e|ing)\s+an?\s+agreement)\b", re.I)
+RUMOR_MARKERS = re.compile(r"\b(report(?:ed|ing)ly|according\s+to\s+sources|rumors?)\b", re.I)
+
+def _recent_enough(sentence: str, current_year: int) -> bool:
+    years = [int(y) for y in YEAR_OLD.findall(sentence or "")]
+    return (not years) or (max(years) >= current_year - 1)
+
+def _not_background(sentence: str) -> bool:
+    return not BACKGROUND_MARKERS.search(sentence or "")
+
+def _not_intent_or_rumor(sentence: str) -> bool:
+    return not (INTENT_MARKERS.search(sentence or "") or RUMOR_MARKERS.search(sentence or ""))
+
+def _lead_sentences(text: str, k: int = 2):
+    sents = re.split(_SENT_SPLIT, text or "")
+    return [s for s in sents[:k] if s and s.strip()]
 LICENSE_GUARD = re.compile(r"\blicen[sc]e|licensing|licensed\b", re.I)
 NEGATION_END = [re.compile(p, re.I) for p in [
     r"\bterminated\b|\btermination\b|\bending\b|\bended\b|\bcancel(?:led|lation)?\b",
@@ -171,8 +200,206 @@ LICENSE_OUT_QUERIES = [
     "exclusive distribution and license agreement with rights granted to partner",
 ]
 
-_embed_cache = {}
-_client = None
+# ===================== SUPPLY / PURCHASE / GOV-CONTRACT (regex + embeddings) =====================
+GOV_ENTITY = re.compile(r"""
+    \b(
+        (U\.?S\.?\s+)?(Federal|State|City|County)\s+Government|Government\b|Govt\b|
+        Department\s+of\s+\w+|Ministry\s+of\s+\w+|
+        DoD|Pentagon|US\s+Army|US\s+Navy|US\s+Air\s+Force|
+        NASA|NIH|BARDA|DARPA|HHS\b|DOE\b|DoE\b|DHS|DOJ|DOT|FDA|EMA|NHS|GSA|
+        European\s+Commission|EC\b|EU\b|UK\s+MoD|HM\s+Government|Home\s+Office|Treasury|
+        (Republic|Kingdom)\s+of\s+\w+|Korea\s+Government|Korean\s+Government|
+        Ministry\s+of\s+Defense|Ministry\s+of\s+Defence|Ministry\s+of\s+Health|Ministry\s+of\s+Industry|
+        국방부|정부|산업통상자원부|보건복지부|과학기술정보통신부|조달청
+    )\b
+""", re.I | re.X)
+
+NEGATION_GENERIC = [re.compile(p, re.I) for p in [
+    r"\bterminated\b|\btermination\b|\bending\b|\bended\b|\bcancel(?:led|lation)?\b",
+    r"\bexpired\b|\bexpiry\b|\bnot\s+proceeding\b|\bnon[- ]binding\b|\bnonbinding\b|\bMOU\b",
+    r"\bletter\s+of\s+intent\b|\bLOI\b",
+]]
+
+SUPPLY_POS = [re.compile(p, re.I) for p in [
+    r"\b(supply|supplies|supplying)\s+(agreement|contract|deal)\b",
+    r"\b(supplier|supply)\s+agreement\s+with\b",
+    r"\bentered\s+into\s+(a[n]?\s+)?(long[- ]term|multi[- ]year)?\s*supply\s+(agreement|contract|deal)\b",
+    r"\bframework\s+supply\s+agreement\b",
+    r"\b(master|strategic)\s+supply\s+(agreement|contract|deal)\b",
+    r"\bsupply\s+and\s+distribution\s+agreement\b",
+    r"\b(awarded|wins?|win)\s+(an?\s+)?supply\s+contract\b",
+    r"\baward(?:ed)?\s+of\s+contract\b",
+    r"\bcontract\s+award\b",
+    r"\bsupply\s+deal(\s+with)?\b",
+    r"\bcall[- ]off\s+(contract|order)s?\b",
+    r"\bblanket\s+purchase\s+agreement\b",
+    r"\bGSA\s+Schedule\s+(contract|award)\b",
+    r"\bframework\s+agreement\s+for\s+(supply|procurement|purchase)\b",
+]]
+
+PURCHASE_POS = [re.compile(p, re.I) for p in [
+    r"\b(purchase|procurement)\s+(agreement|contract|order|orders|po|deal)\b",
+    r"\b(awarded|wins?|win)\s+(an?\s+)?(purchase|procurement)\s+contract\b",
+    r"\bentered\s+into\s+(a[n]?\s+)?(purchase|procurement)\s+(agreement|contract|deal)\b",
+    r"\b(IDIQ|indefinite[- ]delivery|indefinite[- ]quantity)\s+(contract|award)\b",
+    r"\bframework\s+purchase\s+agreement\b",
+    r"\breceived\s+purchase\s+orders?\s+under\s+(a\s+)?master\s+supply\s+agreement\b",
+    r"(?<!I)\bPOs?\b",
+    r"\bpurchase\s+deal(\s+with)?\b",
+    r"\bprocurement\s+deal\b",
+    r"\bblanket\s+purchase\s+agreement\b",
+    r"\bcall[- ]off\s+(contract|order)s?\b",
+]]
+
+SUPPLY_QUERIES = [
+    "entered into a long-term supply agreement with partner",
+    "signed a multi-year supply contract for components",
+    "signed a framework supply agreement with a partner",
+    "strategic supply contract for large-scale manufacturing",
+    "supply and distribution agreement with partner",
+    "received purchase orders under a master supply agreement",
+    "entered into a master supply agreement with a global OEM partner",
+    "signed a supplier agreement with Company B",
+    "entered into a framework agreement for the supply of components",
+    "contract award for supply of materials",
+    "awarded a supply contract by the Ministry of Defense",
+    "supply deal with multinational manufacturer",
+]
+
+PURCHASE_QUERIES = [
+    "entered into a purchase agreement with another company",
+    "awarded a purchase contract by a corporation",
+    "signed a procurement contract with an industry partner",
+    "wins IDIQ procurement contract from a corporate buyer",
+    "entered into a framework purchase agreement",
+    "received purchase orders under a master supply agreement",
+    "purchase order under a master agreement",
+    "call-off contract under a framework agreement",
+    "blanket purchase agreement with a key customer",
+    "procurement deal signed with a strategic partner",
+]
+
+GOV_CONTRACT_QUERIES = [
+    "awarded a government procurement contract",
+    "wins IDIQ contract from the U.S. Army",
+    "awarded a purchase contract by the Department of Defense",
+    "signed a supply contract with the Ministry of Defense",
+    "entered into a procurement agreement with the Ministry of Health",
+    "awarded a supply contract by the European Commission",
+    "signed a strategic supply deal with the Government of Korea",
+    "entered into a supply agreement with the U.S. Department of Energy",
+    "government contract award to Company A for production and supply",
+    "awarded a contract for manufacturing of systems",
+]
+
+def _has_any(text: str, patterns):
+    return any(p.search(text) for p in patterns)
+
+def _no_negation(text: str):
+    return not any(p.search(text) for p in NEGATION_GENERIC)
+
+def _max_sim(vec, qvecs):
+    if not vec: return 0.0
+    return max(_cos(vec, q) for q in qvecs)
+
+
+def is_supply_or_purchase_doc(title: str, body: str):
+    """
+    Returns (matched: bool, info: dict)
+    category in {"corp_supply","corp_purchase","gov_supply","gov_purchase"}
+    Guardrails applied: recency, background/intent/rumor exclusion, stronger later-paragraph requirements.
+    """
+    text = f"{title or ''} {body or ''}"
+    if not _no_negation(text):
+        return False, {"reason": "negation found"}
+
+    import datetime
+    current_year = datetime.datetime.now().year
+
+    # 1) Title + lead sentences (strict recency & intent guards)
+    for s in [x for x in [title] + _lead_sentences(body, k=2) if x]:
+        if _not_background(s) and _recent_enough(s, current_year):
+            is_supply = _has_any(s, SUPPLY_POS)
+            is_purchase = _has_any(s, PURCHASE_POS)
+            if is_supply or is_purchase:
+                if GOV_ENTITY.search(s):
+                    cat = "gov_supply" if is_supply else "gov_purchase"
+                else:
+                    cat = "corp_supply" if is_supply else "corp_purchase"
+                if _has_intent_marker(s):
+                    cat = f"{cat}_intent"
+                return True, {"category": cat, "exact": True, "semantic": False, "zone": "title/lead"}
+
+    # 2) Later paragraphs: require company or value cues
+    for s in re.split(_SENT_SPLIT, body or ""):
+        if not s or not s.strip():
+            continue
+        if not (_not_background(s) and _recent_enough(s, current_year)):
+            continue
+        is_supply = _has_any(s, SUPPLY_POS)
+        is_purchase = _has_any(s, PURCHASE_POS)
+        if is_supply or is_purchase:
+            has_company = bool(TICKER_RE.search(s)) or bool(re.search(r"\b(Inc\.|Corp\.|PLC|Ltd\.|LLC|S\.?A\.|Co\.)\b", s))
+            has_value   = bool(re.search(r"\$\s?\d+(?:\.\d+)?\s?(?:M|B|million|billion)", s, re.I))
+            if has_company or has_value:
+                if GOV_ENTITY.search(s):
+                    cat = "gov_supply" if is_supply else "gov_purchase"
+                else:
+                    cat = "corp_supply" if is_supply else "corp_purchase"
+                if _has_intent_marker(s):
+                    cat = f"{cat}_intent"
+                return True, {"category": cat, "exact": True, "semantic": False, "zone": "body_strict"}
+
+    # 3) Embedding fallback (guarded by background/intent)
+    try:
+        tvec = _vec(_normalize(title)) if title else None
+        bvec = _vec(_normalize(body)) if body else None
+
+        q_supply = [_vec(q) for q in SUPPLY_QUERIES]
+        q_purchase = [_vec(q) for q in PURCHASE_QUERIES]
+        q_gov = [_vec(q) for q in GOV_CONTRACT_QUERIES]
+
+        def _max_sim(vec, qs):
+            if not vec: return 0.0
+            return max(_cos(vec, q) for q in qs)
+
+        sim_title_supply = _max_sim(tvec, q_supply)
+        sim_body_supply  = _max_sim(bvec, q_supply)
+        sim_title_purch  = _max_sim(tvec, q_purchase)
+        sim_body_purch   = _max_sim(bvec, q_purchase)
+        sim_title_gov    = _max_sim(tvec, q_gov)
+        sim_body_gov     = _max_sim(bvec, q_gov)
+
+        TH = max(SIM_THRESHOLD, 0.86)
+        body_guard = _not_background(body or "")
+
+        sims = {
+            "supply": max(sim_body_supply, sim_title_supply),
+            "purchase": max(sim_body_purch, sim_title_purch),
+            "gov": max(sim_body_gov, sim_title_gov),
+        }
+        best_label, best_sim = max(sims.items(), key=lambda x: x[1])
+
+        if best_sim >= TH and body_guard:
+            is_gov = (best_label == "gov") or bool(GOV_ENTITY.search(text))
+            if is_gov:
+                cat = "gov_supply" if sims["supply"] >= sims["purchase"] else "gov_purchase"
+            else:
+                cat = "corp_supply" if sims["supply"] >= sims["purchase"] else "corp_purchase"
+            if _has_intent_marker(title or "") or _has_intent_marker(body or ""):
+                cat = f"{cat}_intent"
+            return True, {
+                "category": cat,
+                "exact": False, "semantic": True,
+                "sim_title": max(sim_title_supply, sim_title_purch, sim_title_gov),
+                "sim_body":  max(sim_body_supply,  sim_body_purch,  sim_body_gov),
+                "zone": "embedding",
+            }
+        return False, {"reason": "below threshold",
+                       "sim_title": max(sim_title_supply, sim_title_purch, sim_title_gov),
+                       "sim_body":  max(sim_body_supply,  sim_body_purch,  sim_body_gov)}
+    except Exception as e:
+        return False, {"reason": f"embedding unavailable: {e}"}
 
 def _openai_client():
     global _client
@@ -284,28 +511,20 @@ def rss_entries() -> List[dict]:
     return out
 
 # ===================== Company detection =====================
-TICKER_RE = re.compile(r"""
-    (?<![A-Z0-9$])      # not preceded by ticker-like char
-    \$?                 # optional leading dollar sign
-    ([A-Z]{2,5})         # core ticker: 2-5 uppercase letters
-    (?![A-Z0-9])         # not followed by ticker-like char
-""", re.VERBOSE)
+TICKER_RE = re.compile(r"(?<![A-Z])\\$?([A-Z]{1,5})(?![A-Z])")
 
 def pick_companies(text: str, ticker_map: Dict[str,str], name_index: Dict[str,Tuple[str,str]]) -> List[Tuple[str,str]]:
-    found: Dict[str, str] = {}
-    # 1) Ticker-style matches ($TSLA, TSLA)
-    for m in TICKER_RE.finditer((text or "").upper()):
+    found = {}
+    for m in TICKER_RE.finditer(text.upper()):
         t = m.group(1)
         if t in ticker_map:
             found[t] = ticker_map[t]
-    # 2) Company name substring matches (normalized)
-    norm = normalize_name(text or "")
+    norm = normalize_name(text)
     for name, (t, cik) in name_index.items():
         if len(name) >= 4 and name in norm:
             found[t] = cik
     return [(t, cik) for t, cik in found.items()]
 
-# ===================== Scan cycle & Web =====================
 # ===================== Scan cycle & Web =====================
 class CycleStats(BaseModel):
     last_started: Optional[str] = None
@@ -336,11 +555,14 @@ def run_cycle():
             continue
         title = e["title"]; body = e["summary"]
         ok, dbg = is_license_out_doc(title, body)
-        if not ok:
+        sp_ok, sp_dbg = is_supply_or_purchase_doc(title, body)
+        if not ok and not sp_ok:
             continue
 
         companies = pick_companies(f"{title}\\n{body}", ticker_map, name_index)
-        if not companies:
+        if ok and not companies:
+            continue
+        if sp_ok and sp_dbg.get("category","").startswith("corp") and not companies:
             continue
 
         hits += 1
@@ -350,7 +572,8 @@ def run_cycle():
         summary = summarize_and_translate(text, TARGET_LANG)
         ticker_line = ", ".join([f"{t} (CIK {c})" for t,c in companies])
         desc = summary + (f"\\n\\n{ticker_line}" if ticker_line else "")
-        push_discord(f"[RSS] {title}", desc, e.get("link",""))
+        tag = "LICENSE" if ok else sp_dbg.get("category","").upper()
+        push_discord(f"[RSS][{tag}] {title}", desc, e.get("link",""))
 
     _stats.last_finished = iso_now()
     _stats.last_hits = hits
