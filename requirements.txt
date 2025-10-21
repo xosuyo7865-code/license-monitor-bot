@@ -1,5 +1,5 @@
 beautifulsoup4
-readability-lxml
+html5lib
 fastapi
 uvicorn
 requests
