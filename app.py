@@ -1,4 +1,3 @@
-
 import os, re, time, json, hashlib, datetime, math, threading
 from typing import Dict, List, Tuple, Set, Optional
 from pathlib import Path
@@ -408,6 +407,9 @@ def _openai_client():
         _client = OpenAI(api_key=OPENAI_API_KEY)
     return _client
 
+_embed_cache: Dict[str, List[float]] = {}
+_client = None
+
 def _vec(text: str):
     key = f"emb::{hashlib.sha256((text or '').encode('utf-8')).hexdigest()[:16]}"
     if key in _embed_cache:
@@ -491,7 +493,7 @@ def summarize_and_translate(text: str, lang: str = TARGET_LANG) -> str:
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
-        prompt = f"Summarize the following article in {lang}. Keep it concise (5-7 bullets or 4-6 sentences):\\n\\n{text}"
+        prompt = f"Summarize the following article in {lang}. Keep it concise (5-7 bullets or 4-6 sentences):\n\n{text}"
         resp = client.chat.completions.create(
             model=SUMMARY_MODEL,
             messages=[{"role":"user","content":prompt}],
@@ -499,7 +501,7 @@ def summarize_and_translate(text: str, lang: str = TARGET_LANG) -> str:
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        return f"[summary_failed] {str(e)[:200]}\\n\\n{text[:1000]}"
+        return f"[summary_failed] {str(e)[:200]}\n\n{text[:1000]}"
 
 # ===================== RSS helpers =====================
 def load_rss_seen() -> Set[str]:
@@ -535,6 +537,63 @@ def rss_entries() -> List[dict]:
         except Exception as ex:
             print(f"[rss] fetch error: {url} -> {ex}")
     return out
+
+# ===================== HTML full-text fetch & extract =====================
+from urllib.parse import urljoin
+
+def _clean_text(s: str) -> str:
+    s = s or ""
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+def fetch_article_text(url: str, timeout: int = 20) -> str:
+    """Fetch article HTML and extract readable text. Falls back gracefully if libs missing.
+    Priority: readability-lxml > <article>/<main> paragraphs > all paragraphs.
+    """
+    if not url:
+        return ""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as e:
+        print(f"[fetch] failed {url}: {e}")
+        return ""
+
+    # Try readability-lxml if available
+    try:
+        from readability import Document  # type: ignore
+        doc = Document(html)
+        content_html = doc.summary(html_partial=True) or ""
+        try:
+            from bs4 import BeautifulSoup  # type: ignore
+            soup = BeautifulSoup(content_html, "html.parser")
+            text = "\n".join(p.get_text(" ", strip=True) for p in soup.find_all(["p","li"]))
+            return _clean_text(text)[:MAX_ARTICLE_LEN]
+        except Exception:
+            # crude fallback: strip tags
+            text = re.sub(r"<[^>]+>", " ", content_html)
+            return _clean_text(text)[:MAX_ARTICLE_LEN]
+    except Exception:
+        pass
+
+    # Fallback: BeautifulSoup heuristic
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+        soup = BeautifulSoup(html, "html.parser")
+        # Remove scripts/styles
+        for t in soup(["script","style","noscript"]):
+            t.decompose()
+        # Prefer <article> or <main>
+        cand = soup.find("article") or soup.find("main") or soup
+        paras = cand.find_all("p")
+        if not paras:
+            paras = soup.find_all("p")
+        text = "\n".join(p.get_text(" ", strip=True) for p in paras)
+        return _clean_text(text)[:MAX_ARTICLE_LEN]
+    except Exception as e:
+        print(f"[extract] bs4 failed for {url}: {e}")
+        return ""
 
 # ===================== Company detection =====================
 TICKER_RE = re.compile(r"(?<![A-Z])\$?([A-Z]{1,5})(?![A-Z])")  # fixed: use \$? (not \\$?)
@@ -579,39 +638,47 @@ def run_cycle():
         key = e["key"]
         if not key or key in seen:
             continue
-        title = e["title"]; body = e["summary"]
-        ok, dbg = is_license_out_doc(title, body)
-        sp_ok, sp_dbg = is_supply_or_purchase_doc(title, body)
+        title = e["title"]
+        body_summary = e["summary"]
+        link = e.get("link", "")
+
+        # === NEW: fetch full article body ===
+        body_full = fetch_article_text(link) if link else ""
+        body_for_detection = body_full or body_summary
+
+        ok, dbg = is_license_out_doc(title, body_for_detection)
+        sp_ok, sp_dbg = is_supply_or_purchase_doc(title, body_for_detection)
         if not ok and not sp_ok:
             continue
 
-        companies = pick_companies(f"{title}\\n{body}", ticker_map, name_index)
+        companies = pick_companies(f"{title}\n{body_for_detection}", ticker_map, name_index)
         if ok and not companies:
             continue
-        if sp_ok and sp_dbg.get("category","").startswith("corp") and not companies:
+        if sp_ok and sp_dbg.get("category","{}").startswith("corp") and not companies:
             continue
 
         hits += 1
         seen.add(key); save_rss_seen(seen)
 
-        text = f"{title}\\n\\n{body}"
-        summary = summarize_and_translate(text, TARGET_LANG)
+        # For LLM summary, prefer full text if available
+        text_for_summary = f"{title}\n\n{body_full or body_summary}"
+        summary = summarize_and_translate(text_for_summary, TARGET_LANG)
         ticker_line = ", ".join([f"{t} (CIK {c})" for t,c in companies])
-        desc = summary + (f"\\n\\n{ticker_line}" if ticker_line else "")
-        tag = "LICENSE" if ok else sp_dbg.get("category","").upper()
+        desc = summary + (f"\n\n{ticker_line}" if ticker_line else "")
+        tag = "LICENSE" if ok else sp_dbg.get("category","{}").upper()
         # Convert ISO back to aware datetime
         pub_iso = e.get("published_dt")
         pub_dt = datetime.datetime.fromisoformat(pub_iso) if pub_iso else None
-        push_discord(f"[RSS][{tag}] {title}", desc, e.get("link",""), published_dt_utc=pub_dt)
+        push_discord(f"[RSS][{tag}] {title}", desc, link, published_dt_utc=pub_dt)
 
     _stats.last_finished = iso_now()
     _stats.last_hits = hits
     _stats.last_entries = len(entries)
     _stats.total_hits += hits
     _stats.total_cycles += 1
-    print(f"[cycle] entries={len(entries)}, hits={hits}, seen={len(seen)}")
+    print(f"[cycle] entries={len(entries)}, hits={hits}, seen={len(seen)})")
 
-app = FastAPI(title="RSS→SEC→Summary→Discord")
+app = FastAPI(title="RSS→SEC→Summary→Discord (FullText)")
 
 @app.get("/healthz")
 def healthz():
@@ -641,6 +708,6 @@ def _bg_loop():
 @app.on_event("startup")
 def _startup():
     ensure_ticker_cache()
-    print(f"[BOOT] Web mode. Random interval 35~50s per cycle. data={TICKER_CIK_PATH}")
+    print(f"[BOOT] Web mode (FullText). Random interval 35~50s per cycle. data={TICKER_CIK_PATH}")
     t = threading.Thread(target=_bg_loop, daemon=True)
     t.start()
