@@ -114,8 +114,8 @@ except Exception:
     OpenAI = None
 
 EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-SIM_THRESHOLD    = float(os.getenv("SIM_THRESHOLD", "0.84"))
-TITLE_BONUS      = float(os.getenv("TITLE_BONUS", "0.03"))
+SIM_THRESHOLD    = float(os.getenv("SIM_THRESHOLD", "0.78"))
+TITLE_BONUS      = float(os.getenv("TITLE_BONUS", "0.02"))
 MAX_ARTICLE_LEN  = int(os.getenv("MAX_ARTICLE_LEN", "6000"))
 
 _SENT_SPLIT = re.compile(r'(?<=[\.!?])\s+')
@@ -368,7 +368,7 @@ def is_supply_or_purchase_doc(title: str, body: str):
         sim_title_gov    = _max_sim(tvec, q_gov)
         sim_body_gov     = _max_sim(bvec, q_gov)
 
-        TH = max(SIM_THRESHOLD, 0.86)
+        TH = max(SIM_THRESHOLD, 0.78)
         body_guard = _not_background(body or "")
 
         sims = {
@@ -546,6 +546,14 @@ def _clean_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
+def _bs4_parser() -> str:
+    """Prefer html5lib for robustness; fallback to built-in html.parser if missing."""
+    try:
+        import html5lib  # noqa: F401
+        return "html5lib"
+    except Exception:
+        return "html.parser"
+
 def fetch_article_text(url: str, timeout: int = 20) -> str:
     """Fetch article HTML and extract readable text. Falls back gracefully if libs missing.
     Priority: readability-lxml > <article>/<main> paragraphs > all paragraphs.
@@ -567,7 +575,7 @@ def fetch_article_text(url: str, timeout: int = 20) -> str:
         content_html = doc.summary(html_partial=True) or ""
         try:
             from bs4 import BeautifulSoup  # type: ignore
-            soup = BeautifulSoup(content_html, "html.parser")
+            soup = BeautifulSoup(content_html, _bs4_parser())
             text = "\n".join(p.get_text(" ", strip=True) for p in soup.find_all(["p","li"]))
             return _clean_text(text)[:MAX_ARTICLE_LEN]
         except Exception:
@@ -580,7 +588,7 @@ def fetch_article_text(url: str, timeout: int = 20) -> str:
     # Fallback: BeautifulSoup heuristic
     try:
         from bs4 import BeautifulSoup  # type: ignore
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, _bs4_parser())
         # Remove scripts/styles
         for t in soup(["script","style","noscript"]):
             t.decompose()
