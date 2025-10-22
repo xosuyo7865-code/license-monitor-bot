@@ -301,6 +301,151 @@ def _max_sim(vec, qvecs):
     if not vec: return 0.0
     return max(_cos(vec, q) for q in qvecs)
 
+
+
+# ===================== FDA Resubmission Acceptance/Approval (regex + embeddings) =====================
+FDA_ENTITY = re.compile(r"\b(FDA|Food\s+and\s+Drug\s+Administration)\b", re.I)
+
+FDA_RESUB_TOKENS = re.compile(
+    r"\b(re[-\s]?submission|re[-\s]?fil(?:e|ing)|resubmitted|class\s*[12]\s*resubmission|type\s*-\s*[12]\s*resubmission|CRL|complete\s*response\s*letter)\b",
+    re.I
+)
+
+FDA_ACCEPT_PATTERNS = [
+    re.compile(r"\b(FDA)\s+(has\s+)?(accepted|acceptance\s+for\s+filing|filed|accepted\s+for\s+review)\b", re.I),
+    re.compile(r"\b(accepted|acceptance\s+for\s+filing|accepted\s+for\s+review)\s+by\s+the\s+FDA\b", re.I),
+    re.compile(r"\b(FDA)\s+(has\s+)?(accepted|filed)\s+(the\s+)?(re[-\s]?submission|resubmitted\s+(NDA|BLA|sNDA|sBLA))\b", re.I),
+]
+
+FDA_APPROVAL_PATTERNS = [
+    re.compile(r"\b(FDA)\s+(has\s+)?(approved|granted\s+approval)\b", re.I),
+    re.compile(r"\b(approved|approval)\s+by\s+the\s+FDA\b", re.I),
+    re.compile(r"\b(FDA)\s+(approves|approved)\s+(the\s+)?(resubmitted|re[-\s]?submitted)\s+(NDA|BLA|sNDA|sBLA)\b", re.I),
+    re.compile(r"\b(approval)\s+following\s+(re[-\s]?submission|resubmission)\b", re.I),
+]
+
+FDA_RESUB_EXPLICIT = re.compile(r"\b(NDA|BLA|sNDA|sBLA|505\(b\)\(2\)|PMA|510\(k\)|De\s*Novo)\b", re.I)
+
+NEGATION_FDA = [
+    re.compile(r"\b(not\s+approved|reject(?:ed|ion)|refuse\s+to\s+file|RTF|den(?:y|ied|ial))\b", re.I),
+]
+
+INTENT_RUMOR_FDA = re.compile(
+    r"\b(plans?\s+to|intends?\s+to|aims?\s+to|seeks?\s+to|in\s+talks\s+to|negotiat(?:e|ing)\s+to|reportedly|rumor(?:ed|s)?|according\s+to\s+sources)\b",
+    re.I
+)
+
+FDA_RESUB_EMB_QUERIES = [
+    # Acceptance (접수/수리)
+    "FDA accepts resubmission of NDA",
+    "FDA acceptance for filing of resubmitted BLA",
+    "FDA accepted the Class 2 resubmission",
+    "FDA accepted for review the resubmitted sNDA",
+    "FDA files resubmitted application after CRL",
+    "FDA acknowledges receipt and filing of resubmission",
+    # Approval (승인 확정)
+    "FDA approves resubmitted NDA following CRL",
+    "FDA approval after Class 2 resubmission",
+    "resubmitted BLA receives FDA approval",
+    "FDA grants approval following resubmission",
+    "approval granted by FDA after resubmission",
+    # Neutral but relevant
+    "company announces FDA acceptance of resubmission",
+    "FDA decision following resubmission",
+]
+
+def is_fda_resubmission_doc(title: str, body: str):
+    """
+    Returns (matched: bool, info: dict)
+    category in {"fda_resubmission_accept", "fda_resubmission_approval", "..._intent"}
+    Guards: negation, background, intent/rumor, recency, later-paragraph company/value cues
+    """
+    text = f"{title or ''} {body or ''}"
+    if any(p.search(text) for p in NEGATION_FDA):
+        return False, {"reason": "negation found"}
+    if not FDA_RESUB_TOKENS.search(text):
+        # 재제출 단서 자체가 없으면 빠르게 종료
+        return False, {"reason": "no resubmission token"}
+
+    import datetime
+    current_year = datetime.datetime.now().year
+
+    def _not_background_local(s: str) -> bool:
+        return not BACKGROUND_MARKERS.search(s or "")
+
+    def _recent_enough_local(sentence: str, current_year: int) -> bool:
+        years = [int(y) for y in YEAR_OLD.findall(sentence or "")]
+        return (not years) or (max(years) >= current_year - 1)
+
+    # 1) Title + lead sentences (가장 엄격)
+    for s in [x for x in [title] + _lead_sentences(body, k=2) if x]:
+        if _not_background_local(s) and _recent_enough_local(s, current_year) and FDA_ENTITY.search(s):
+            if any(p.search(s) for p in FDA_APPROVAL_PATTERNS):
+                cat = "fda_resubmission_approval"
+            elif any(p.search(s) for p in FDA_ACCEPT_PATTERNS):
+                cat = "fda_resubmission_accept"
+            else:
+                continue
+            if INTENT_RUMOR_FDA.search(s):
+                cat = f"{cat}_intent"
+            return True, {"category": cat, "exact": True, "semantic": False, "zone": "title/lead"}
+
+    # 2) Later sentences: 회사/금액/NDA/BLA 단서 요구
+    for s in re.split(_SENT_SPLIT, body or ""):
+        if not s or not s.strip():
+            continue
+        if not (_not_background_local(s) and _recent_enough_local(s, current_year)):
+            continue
+        if not (FDA_ENTITY.search(s) and FDA_RESUB_TOKENS.search(s)):
+            continue
+
+        is_approval = any(p.search(s) for p in FDA_APPROVAL_PATTERNS)
+        is_accept   = any(p.search(s) for p in FDA_ACCEPT_PATTERNS)
+        if not (is_approval or is_accept):
+            continue
+
+        has_company = bool(TICKER_RE.search(s)) or bool(re.search(r"\b(Inc\.|Corp\.|PLC|Ltd\.|LLC|S\.?A\.|Co\.)\b", s))
+        has_value   = bool(re.search(r"\$\s?\d+(?:\.\d+)?\s?(?:M|B|million|billion)", s, re.I))
+        has_app     = bool(FDA_RESUB_EXPLICIT.search(s))
+
+        if has_company or has_value or has_app:
+            cat = "fda_resubmission_approval" if is_approval else "fda_resubmission_accept"
+            if INTENT_RUMOR_FDA.search(s):
+                cat = f"{cat}_intent"
+            return True, {"category": cat, "exact": True, "semantic": False, "zone": "body_strict"}
+
+    # 3) Embedding fallback
+    try:
+        tvec = _vec(_normalize(title)) if title else None
+        bvec = _vec(_normalize(body)) if body else None
+        qvecs = [_vec(q) for q in FDA_RESUB_EMB_QUERIES]
+
+        def _max_sim_local(vec):
+            if not vec: return 0.0
+            return max(_cos(vec, q) for q in qvecs)
+
+        sim_title = _max_sim_local(tvec)
+        sim_body  = _max_sim_local(bvec)
+        TH = max(SIM_THRESHOLD, 0.78)
+
+        if max(sim_title, sim_body) >= TH and _not_background_local(body or ""):
+            text2 = (title or "") + " " + (body or "")
+            if any(p.search(text2) for p in FDA_APPROVAL_PATTERNS):
+                cat = "fda_resubmission_approval"
+            elif any(p.search(text2) for p in FDA_ACCEPT_PATTERNS):
+                cat = "fda_resubmission_accept"
+            else:
+                cat = "fda_resubmission_accept"
+
+            if INTENT_RUMOR_FDA.search(text2):
+                cat = f"{cat}_intent"
+
+            return True, {"category": cat, "exact": False, "semantic": True, "sim_title": sim_title, "sim_body": sim_body, "zone": "embedding"}
+
+        return False, {"reason": "below threshold", "sim_title": sim_title, "sim_body": sim_body}
+    except Exception as e:
+        return False, {"reason": f"embedding unavailable: {e}"}        
+
 def is_supply_or_purchase_doc(title: str, body: str):
     """
     Returns (matched: bool, info: dict)
@@ -656,7 +801,8 @@ def run_cycle():
 
         ok, dbg = is_license_out_doc(title, body_for_detection)
         sp_ok, sp_dbg = is_supply_or_purchase_doc(title, body_for_detection)
-        if not ok and not sp_ok:
+        fda_ok, fda_dbg = is_fda_resubmission_doc(title, body_for_detection)
+        if not (ok or sp_ok or fda_ok):
             continue
 
         companies = pick_companies(f"{title}\n{body_for_detection}", ticker_map, name_index)
@@ -664,6 +810,7 @@ def run_cycle():
             continue
         if sp_ok and sp_dbg.get("category","{}").startswith("corp") and not companies:
             continue
+        # fda_ok는 companies 없어도 허용
 
         hits += 1
         seen.add(key); save_rss_seen(seen)
@@ -673,7 +820,12 @@ def run_cycle():
         summary = summarize_and_translate(text_for_summary, TARGET_LANG)
         ticker_line = ", ".join([f"{t} (CIK {c})" for t,c in companies])
         desc = summary + (f"\n\n{ticker_line}" if ticker_line else "")
-        tag = "LICENSE" if ok else sp_dbg.get("category","{}").upper()
+        if ok:
+            tag = "LICENSE"
+        elif sp_ok:
+            tag = sp_dbg.get("category","{}").upper()
+        else:
+            tag = fda_dbg.get("category","fda_resubmission").upper()
         # Convert ISO back to aware datetime
         pub_iso = e.get("published_dt")
         pub_dt = datetime.datetime.fromisoformat(pub_iso) if pub_iso else None
